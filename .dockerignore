@@ -1,0 +1,36 @@
+# Git
+.git
+.gitignore
+
+# Python cache and artifacts
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker files (not needed in build context)
+Dockerfile*
+.dockerignore*
+
+# Documentation (not needed for runtime)
+README.md
+*.md
+
+# Model cache (downloaded at runtime)
+models/
