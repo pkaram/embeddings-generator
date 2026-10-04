@@ -7,7 +7,7 @@ A production-ready framework for generating text embeddings using Docker contain
 - 🚀 **FastAPI-based REST API** with automatic OpenAPI documentation
 - 🐳 **Docker-first approach** with CPU-only inference for cost efficiency
 - 🤗 **Hugging Face integration** with support for sentence-transformers models
-- 📊 **Comprehensive monitoring** with health checks and metrics
+- 📊 **Measurement suite** for latency percentiles, throughput, cold vs warm load, retrieval quality, and concurrency
 - 🔧 **Configurable** via environment variables
 - 🛡️ **Production-ready** with proper logging, error handling, and security
 - 📦 **Easy deployment** with Docker Compose
@@ -88,7 +88,7 @@ curl -X POST "http://localhost:8000/embeddings" \
        "batch_size": 16
      }'
 ```
-Note that depending on the model used in **model_name**, model will first be loaded (if not loaded already), therefore initial request with new model will be executed slower.
+The first request for a model that is not resident pays `load_time` as well as `processing_time`. Later requests for the same model report `load_time` of 0. A download from Hugging Face is included in `load_time` only when the model is not already in the cache.
 
 #### Response
 ```json
@@ -101,68 +101,103 @@ Note that depending on the model used in **model_name**, model will first be loa
   "model_name": "sentence-transformers/all-MiniLM-L6-v2",
   "dimensions": 384,
   "processing_time": 0.15,
+  "load_time": 0.0,
+  "batch_size": 16,
   "total_texts": 3
 }
 ```
 
+`processing_time` is only the forward pass. `load_time` is the time spent loading the model for this request, and it is `0` when that model is already resident. The client-observed HTTP time, including JSON, is measured by the benchmark tools rather than returned by the API.
+
 ## Configuration
 
-The application can be configured by modifying MAX_BATCH_SIZE, MAX_SEQUENCE_LENGTH in start_container.sh 
+Set `MAX_BATCH_SIZE`, `MAX_SEQUENCE_LENGTH`, and `MAX_TEXT_CHARACTERS` in `scripts/start_container.sh` or as environment variables.
+
+- `MAX_BATCH_SIZE` (default 64) is forwarded to `SentenceTransformer.encode`. Larger requested values are clamped, and the response `batch_size` is the value actually used.
+- `MAX_SEQUENCE_LENGTH` (default 512) is a token cap. The resident model uses the smaller of this value and its own positional limit, and it truncates longer inputs.
+- `MAX_TEXT_CHARACTERS` (default 20000) rejects a single text that is large enough to be an abuse of the payload limit.
 
 ### Supported Models
 
-The framework supports any sentence-transformers model from Hugging Face. Popular options:
+The framework supports sentence-transformers models from Hugging Face. The comparison set is:
 
-- `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions, fast)
-- `sentence-transformers/all-mpnet-base-v2` (768 dimensions, high quality)
-- `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (multilingual)
+- `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions, speed baseline)
+- `BAAI/bge-small-en-v1.5` (384 dimensions, retrieval-tuned)
+- `sentence-transformers/all-mpnet-base-v2` (768 dimensions, larger quality ceiling on CPU)
 
 
 ### Resource Limits
 
-The configuration includes:
-- Memory limit: 4GB
-- Memory reservation: 2GB
-- Health checks with automatic restart
+`scripts/start_container.sh` sets a 4GB memory limit on the container. The benchmark records process RSS against that limit.
 
 ### Project Structure
 
 ```
 embeddings-generator/
 ├── app/
-│   ├── __init__.py
 │   ├── main.py              # FastAPI application
 │   ├── config.py            # Configuration management
 │   ├── models.py            # Pydantic models
-│   ├── embedding_service.py # Core embedding logic
-│   └── logger.py            # Logging configuration
+│   ├── embedding_service.py # Load and encode
+│   └── measurement.py       # Percentiles and retrieval metrics
+├── benchmarks/              # Latency, retrieval, load, and comparison CLIs
+├── docs/
+│   └── architecture.md      # Request path and measurement clocks
 ├── scripts/
-│   └── start_container.sh     # Build image and start container
+│   ├── start_container.sh   # Build image and start container
+│   └── setup_benchmarks.sh  # Create the local .venv for the benchmark CLI
 ├── tests/
-    ├── __init__.py
-│   └── test_main.py        # Tests for endpoints
-├── Dockerfile              # Docker image definition
-├── requirements.txt        # Python dependencies
-├── pyproject.toml         # Project configuration
-└── README.md              # This file
+├── Dockerfile
+├── requirements.txt         # API image
+├── requirements-benchmark.txt
+└── README.md
 ```
 
-## Monitoring and Health Checks
+## Measurement
 
-The application includes comprehensive monitoring:
+Start the API first (`./scripts/start_container.sh`). The benchmark commands run on the host, from the repository root, and talk to that API. They need a local virtualenv. `.venv` is not committed; create it once per machine:
 
-- **Health endpoint** (`/health`) with model status
-- **Docker health checks** with automatic restart
-- **Structured logging** with configurable levels
-- **Error handling** with detailed error responses
+```bash
+./scripts/setup_benchmarks.sh
+```
 
-## Performance Considerations
+Each command prints a report and writes JSON and Markdown under `results/`.
 
-- **CPU-only inference** for cost efficiency
-- **Batch processing** for improved throughput
-- **Model caching** to avoid repeated downloads
-- **Memory management** with model unloading capabilities
-- **Configurable batch sizes** for different hardware
+```bash
+# Cold load, warmup encode, steady-state p50/p95/p99, throughput, RSS, and CPU.
+# Sweeps batch sizes 1, 8, 16, 32, and 64. Each steady request sends 64 texts.
+.venv/bin/python -m benchmarks benchmark --base-url http://localhost:8000
+
+# BEIR SciFact: Recall@10, MRR@10, and nDCG@10.
+.venv/bin/python -m benchmarks retrieval --base-url http://localhost:8000
+
+# Warm model, concurrency 1, 2, 4, 8, and 16.
+.venv/bin/python -m benchmarks load --base-url http://localhost:8000
+
+# The three comparison models, including retrieval.
+.venv/bin/python -m benchmarks compare --base-url http://localhost:8000
+```
+
+`compare` is the long run: three models, the batch sweep, and the full SciFact corpus. `--requests` (default 30) and `--skip-retrieval` shorten it. `--max-docs` and `--max-queries` score a subset; the report marks that row as a subset. `--timeout` (default 3600 seconds) is how long one request may take, including a first-time model download. Each finished model is written to `results/benchmark-partial.md` before the next one starts.
+
+`--cache-dir` defaults to `./models`, which is the volume mounted by `start_container.sh`. When that directory is visible and the model is not in it, the benchmark records a cache-miss load (download included) and then a cold load from disk. `--measure-cache-miss` deletes the cached model first.
+
+The load test holds a fixed number of requests in flight. Saturation is the first concurrency whose texts/s failed to beat the best lower level by 10 percent. That point is expected to be low: encode blocks the event loop and the process is one worker. See [docs/architecture.md](docs/architecture.md) for the clocks.
+
+## Health and resources
+
+- `GET /health` reports status, version, whether a model is resident, and uptime
+- `GET /system` reports the API process RSS and CPU percent since the previous sample
+- Docker restarts the container when the health check fails
+- Logs include model load time and encode time
+
+## Performance
+
+- CPU-only inference
+- `batch_size` is passed through to the encoder
+- The model cache is mounted at `/app/models` so restarts do not re-download
+- `POST /model/unload` drops the resident model before a cold-load measurement
+- One model is resident at a time
 
 ## Security
 

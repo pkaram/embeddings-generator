@@ -26,8 +26,9 @@ class Settings(BaseSettings):
         default="sentence-transformers/all-MiniLM-L6-v2", env="DEFAULT_MODEL_NAME"
     )
     model_cache_dir: str = Field(default="/app/models", env="MODEL_CACHE_DIR", alias="model_cache_dir")
-    max_batch_size: int = Field(default=32, env="MAX_BATCH_SIZE")
+    max_batch_size: int = Field(default=64, env="MAX_BATCH_SIZE")
     max_sequence_length: int = Field(default=512, env="MAX_SEQUENCE_LENGTH")
+    max_text_characters: int = Field(default=20000, env="MAX_TEXT_CHARACTERS")
 
     # Docker Configuration
     docker_image_name: str = Field(default="embeddings-generator", env="DOCKER_IMAGE_NAME")

@@ -10,6 +10,7 @@ from transformers import AutoTokenizer, AutoModel
 
 from app.config import get_settings
 from app.logger import get_logger
+from app.measurement import model_disk_size_bytes
 
 logger = get_logger(__name__)
 
@@ -28,17 +29,17 @@ class EmbeddingService:
         import os
         os.makedirs(self.settings.model_cache_dir, exist_ok=True)
 
-    def load_model(self, model_name: Optional[str] = None) -> None:
-        """Load a Hugging Face model for embedding generation."""
+    def load_model(self, model_name: Optional[str] = None) -> float:
+        """Load a Hugging Face model. Returns seconds spent loading, or 0 if already resident."""
         model_name = model_name or self.settings.default_model_name
         
         if self.model_name == model_name and self.model is not None:
             logger.info(f"Model {model_name} is already loaded")
-            return
+            return 0.0
         
         try:
             logger.info(f"Loading model: {model_name}")
-            start_time = time.time()
+            start_time = time.perf_counter()
             
             # Load model with CPU-only configuration
             self.model = SentenceTransformer(
@@ -51,11 +52,19 @@ class EmbeddingService:
             self.model.eval()
             if hasattr(self.model, 'to'):
                 self.model.to(self.device)
+
+            # Cap token length at the model's own positional limit.
+            native_limit = getattr(self.model, "max_seq_length", self.settings.max_sequence_length)
+            self.model.max_seq_length = min(int(native_limit), int(self.settings.max_sequence_length))
             
             self.model_name = model_name
             
-            load_time = time.time() - start_time
-            logger.info(f"Model {model_name} loaded successfully in {load_time:.2f} seconds")
+            load_time = time.perf_counter() - start_time
+            logger.info(
+                f"Model {model_name} loaded successfully in {load_time:.2f} seconds "
+                f"(max_seq_length={self.model.max_seq_length} tokens)"
+            )
+            return load_time
             
         except Exception as e:
             logger.error(f"Failed to load model {model_name}: {str(e)}")
@@ -67,44 +76,50 @@ class EmbeddingService:
         model_name: Optional[str] = None,
         normalize: bool = True,
         batch_size: Optional[int] = None
-    ) -> Tuple[List[List[float]], float]:
-        """Generate embeddings for a list of texts."""
+    ) -> Tuple[List[List[float]], float, float, int]:
+        """Generate embeddings for a list of texts.
+
+        Returns ``(embeddings, encode_time_seconds, load_time_seconds, batch_size)``.
+        ``encode_time_seconds`` is only the forward pass. Load time is zero
+        when the requested model is already resident. ``batch_size`` is the
+        value actually passed to the encoder after clamping.
+        """
         if not texts:
             raise ValueError("Texts list cannot be empty")
         
-        # Load model if needed
-        self.load_model(model_name)
+        # Load model if needed. This clock is separate from the encode clock.
+        load_time = self.load_model(model_name)
         
         if self.model is None:
             raise RuntimeError("Model is not loaded")
         
-        # Use provided batch size or default
-        batch_size = batch_size or self.settings.max_batch_size
+        # The library batches internally. Clamping here keeps a request from
+        # exceeding the configured memory budget.
+        requested = self.settings.max_batch_size if batch_size is None else batch_size
+        batch_size = max(1, min(int(requested), self.settings.max_batch_size))
         
         try:
-            logger.info(f"Generating embeddings for {len(texts)} texts using model {self.model_name}")
-            start_time = time.time()
+            logger.info(
+                f"Generating embeddings for {len(texts)} texts using model {self.model_name} "
+                f"with batch_size={batch_size}"
+            )
+            start_time = time.perf_counter()
+            encoded = self.model.encode(
+                texts,
+                batch_size=batch_size,
+                convert_to_tensor=False,
+                normalize_embeddings=normalize,
+                show_progress_bar=False
+            )
+            all_embeddings = encoded.tolist()
             
-            # Generate embeddings in batches
-            all_embeddings = []
-            for i in range(0, len(texts), batch_size):
-                batch_texts = texts[i:i + batch_size]
-                logger.debug(f"Processing batch {i//batch_size + 1}: {len(batch_texts)} texts")
-                
-                # Generate embeddings for the batch
-                batch_embeddings = self.model.encode(
-                    batch_texts,
-                    convert_to_tensor=False,
-                    normalize_embeddings=normalize,
-                    show_progress_bar=False
-                )
-                
-                all_embeddings.extend(batch_embeddings.tolist())
+            encode_time = time.perf_counter() - start_time
+            logger.info(
+                f"Generated embeddings for {len(texts)} texts in {encode_time:.2f} seconds "
+                f"(load_time={load_time:.2f}s)"
+            )
             
-            processing_time = time.time() - start_time
-            logger.info(f"Generated embeddings for {len(texts)} texts in {processing_time:.2f} seconds")
-            
-            return all_embeddings, processing_time
+            return all_embeddings, encode_time, load_time, batch_size
             
         except Exception as e:
             logger.error(f"Failed to generate embeddings: {str(e)}")
@@ -118,6 +133,7 @@ class EmbeddingService:
                 "model_type": None,
                 "max_sequence_length": None,
                 "embedding_dimensions": None,
+                "model_size_bytes": None,
                 "is_loaded": False
             }
         
@@ -138,6 +154,9 @@ class EmbeddingService:
                 "model_type": "sentence-transformer",
                 "max_sequence_length": max_length,
                 "embedding_dimensions": dimensions,
+                "model_size_bytes": model_disk_size_bytes(
+                    self.settings.model_cache_dir, self.model_name
+                ),
                 "is_loaded": True
             }
             
@@ -148,6 +167,7 @@ class EmbeddingService:
                 "model_type": "sentence-transformer",
                 "max_sequence_length": self.settings.max_sequence_length,
                 "embedding_dimensions": None,
+                "model_size_bytes": None,
                 "is_loaded": False
             }
 

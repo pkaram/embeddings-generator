@@ -1,4 +1,7 @@
 models/
+results/
+data/
+.venv/
 *.pyc
 .pytest_cache/
 .DS_Store

@@ -1,0 +1,4 @@
+# Host-side dependencies for python -m benchmarks.
+# The API itself runs in Docker and uses requirements.txt.
+httpx==0.25.2
+numpy>=1.26.0

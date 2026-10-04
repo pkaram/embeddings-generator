@@ -23,6 +23,7 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
 
 # Copy application code
 COPY app/ ./app/
+COPY benchmarks/ ./benchmarks/
 COPY tests/ ./tests/
 COPY startup.sh ./startup.sh
 

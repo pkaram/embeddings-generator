@@ -4,7 +4,8 @@ import time
 from contextlib import asynccontextmanager
 from typing import Dict, Any
 
-from fastapi import FastAPI, HTTPException, Depends
+import psutil
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -16,14 +17,17 @@ from app.models import (
     EmbeddingResponse,
     HealthResponse,
     ModelInfo,
-    ErrorResponse
+    ErrorResponse,
+    SystemResponse,
 )
 
 logger = get_logger(__name__)
 settings = get_settings()
 
-# Track application start time
+# Track application start time and prime the process CPU counter.
 app_start_time = time.time()
+_process = psutil.Process()
+_process.cpu_percent(interval=None)
 
 
 @asynccontextmanager
@@ -128,16 +132,21 @@ async def get_model_info():
 async def generate_embeddings(request: EmbeddingRequest):
     """Generate embeddings for the provided texts."""
     try:
-        # Check text lengths
+        # Character cap is an abuse guard. Token truncation happens inside the
+        # model at max_seq_length, which is a token limit, not a character limit.
         for i, text in enumerate(request.texts):
-            if len(text) > settings.max_sequence_length:
+            if len(text) > settings.max_text_characters:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Text at index {i} exceeds maximum length of {settings.max_sequence_length} characters"
+                    detail=(
+                        f"Text at index {i} exceeds maximum length of "
+                        f"{settings.max_text_characters} characters"
+                    )
                 )
         
-        # Generate embeddings
-        embeddings, processing_time = embedding_service.generate_embeddings(
+        # Encode runs on the event loop. With the default single worker, concurrent
+        # requests queue behind the forward pass. The load test measures that point.
+        embeddings, processing_time, load_time, effective_batch_size = embedding_service.generate_embeddings(
             texts=request.texts,
             model_name=request.model_name,
             normalize=request.normalize,
@@ -152,6 +161,8 @@ async def generate_embeddings(request: EmbeddingRequest):
             model_name=model_info["model_name"],
             dimensions=model_info["embedding_dimensions"],
             processing_time=processing_time,
+            load_time=load_time,
+            batch_size=effective_batch_size,
             total_texts=len(request.texts)
         )
         
@@ -160,6 +171,15 @@ async def generate_embeddings(request: EmbeddingRequest):
     except Exception as e:
         logger.error(f"Failed to generate embeddings: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/system", response_model=SystemResponse)
+async def system_metrics():
+    """Resident memory and process CPU since the previous sample."""
+    return SystemResponse(
+        rss_bytes=_process.memory_info().rss,
+        cpu_percent=_process.cpu_percent(interval=None),
+    )
 
 
 @app.post("/model/load")
