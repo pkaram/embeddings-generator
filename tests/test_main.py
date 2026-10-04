@@ -65,6 +65,53 @@ def test_embeddings_endpoint_too_many_texts():
     assert response.status_code == 422
 
 
+def test_system_endpoint_reports_process_rss():
+    """Process memory is sampled from inside the API process."""
+    response = client.get("/system")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["rss_bytes"] > 0
+    assert "cpu_percent" in data
+
+
+def test_embeddings_split_load_and_encode_time(monkeypatch):
+    """A warm request reports encode time separately from a zero load time."""
+    monkeypatch.setattr(
+        "app.main.embedding_service.generate_embeddings",
+        lambda texts, model_name, normalize, batch_size: ([[0.1, 0.2]], 0.01, 0.0, 8),
+    )
+    monkeypatch.setattr(
+        "app.main.embedding_service.get_model_info",
+        lambda: {
+            "model_name": "unit-test-model",
+            "model_type": "sentence-transformer",
+            "max_sequence_length": 256,
+            "embedding_dimensions": 2,
+            "model_size_bytes": 128,
+            "is_loaded": True,
+        },
+    )
+    response = client.post("/embeddings", json={"texts": ["a" * 600], "batch_size": 8})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["processing_time"] == 0.01
+    assert data["load_time"] == 0.0
+    assert data["batch_size"] == 8
+    assert data["dimensions"] == 2
+
+
+def test_embeddings_rejects_only_the_character_safety_cap():
+    """Token length is enforced by the model. The API caps raw characters."""
+    response = client.post("/embeddings", json={"texts": ["a" * 20001]})
+    assert response.status_code == 400
+    assert "characters" in response.json()["detail"]
+
+
+def test_embeddings_rejects_non_positive_batch_size():
+    response = client.post("/embeddings", json={"texts": ["hello"], "batch_size": 0})
+    assert response.status_code == 422
+
+
 def test_docs_endpoint():
     """Test that the docs endpoint is accessible."""
     response = client.get("/docs")

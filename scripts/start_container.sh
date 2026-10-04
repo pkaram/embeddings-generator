@@ -36,7 +36,7 @@ docker run -d \
     -v "$(pwd)/${MODELS_DIR}:/app/models" \
     -e DEFAULT_MODEL_NAME="${MODEL_NAME}" \
     -e MODEL_CACHE_DIR="/app/models" \
-    -e MAX_BATCH_SIZE=32 \
+    -e MAX_BATCH_SIZE=64 \
     -e MAX_SEQUENCE_LENGTH=512 \
     --restart unless-stopped \
     --memory=4g \
